@@ -31,10 +31,57 @@ private func createTemporaryDirectory() -> String {
   return tempDirURL.path
 }
 
-private func createLocalImageGenerator(queue: DispatchQueue) -> (String, LocalImageGenerator) {
+enum AppleNeuralEngineOption: String, ExpressibleByArgument {
+  case automatic
+  case off
+  case ane
+  case hybrid
+
+  var state: DeviceCapability.AppleNeuralEngineState? {
+    switch self {
+    case .automatic:
+      return nil
+    case .off:
+      return .disabled
+    case .ane:
+      return .appleNeuralEngineOnly
+    case .hybrid:
+      return .appleNeuralEngineAndGPU
+    }
+  }
+
+  var startupDescription: String {
+    switch self {
+    case .automatic:
+      let resolved: AppleNeuralEngineOption =
+        DeviceCapability.isMFAAppleNeuralEngineFaster ? .hybrid : .off
+      return "automatic (\(resolved.rawValue))"
+    case .off, .ane, .hybrid:
+      return rawValue
+    }
+  }
+}
+
+// ModelPreloader overwrites DeviceCapability.appleNeuralEngineState from the workspace key.
+// The key has to exist before LocalImageGenerator subscribes, or an empty workspace stores
+// the hardware default and the explicit mode never sticks.
+private func applyAppleNeuralEngine(
+  _ option: AppleNeuralEngineOption, workspace: SQLiteWorkspace
+) {
+  if let state = option.state {
+    workspace.dictionary["use_mfa_apple_neural_engine_v2", Int.self] = state.rawValue
+    DeviceCapability.appleNeuralEngineState.store(state, ordering: .releasing)
+  }
+  print("8-bit S Apple Neural Engine: \(option.startupDescription)")
+}
+
+private func createLocalImageGenerator(
+  queue: DispatchQueue, appleNeuralEngine: AppleNeuralEngineOption
+) -> (String, LocalImageGenerator) {
   let tempDir = createTemporaryDirectory()
   let workspace = SQLiteWorkspace(
     filePath: "\(tempDir)/config.sqlite3", fileProtectionLevel: .noProtection)
+  applyAppleNeuralEngine(appleNeuralEngine, workspace: workspace)
   // Just have an empty query result for now
   let configurations = workspace.fetch(for: GenerationConfiguration.self).where(
     GenerationConfiguration.id == 0, limit: .limit(0))
@@ -340,6 +387,13 @@ struct gRPCServerCLI: ParsableCommand {
   @Flag(help: "Disable FlashAttention.")
   var noFlashAttention = false
 
+  @Option(
+    name: .long,
+    help:
+      "8-bit S Apple Neural Engine mode for rowwise int8 GEMM: automatic, off, ane, or hybrid. automatic keeps the hardware default and does not write the workspace key. Use hybrid to match a GUI with 8-bit S Neural Engine enabled."
+  )
+  var appleNeuralEngine: AppleNeuralEngineOption = .automatic
+
   @Option(name: .shortAndLong, help: "The weights cache size in GiB.")
   var weightsCache: Int = 0
 
@@ -415,6 +469,19 @@ struct gRPCServerCLI: ParsableCommand {
       "Echo response will be done on the media generation queue. This helps to use echo call as a health check mechanism."
   )
   var echoOnQueue: Bool = false
+
+  func validate() throws {
+    if noFlashAttention {
+      switch appleNeuralEngine {
+      case .ane, .hybrid:
+        throw ValidationError(
+          "--apple-neural-engine \(appleNeuralEngine.rawValue) requires Flash Attention. Do not pass --no-flash-attention."
+        )
+      case .automatic, .off:
+        break
+      }
+    }
+  }
 
   mutating func run() throws {
     #if os(Linux)
@@ -536,7 +603,8 @@ struct gRPCServerCLI: ParsableCommand {
       try! group.syncShutdownGracefully()
     }
     let queue = DispatchQueue(label: "com.draw-things.edit", qos: .userInteractive)
-    let (tempDir, localImageGenerator) = createLocalImageGenerator(queue: queue)
+    let (tempDir, localImageGenerator) = createLocalImageGenerator(
+      queue: queue, appleNeuralEngine: appleNeuralEngine)
     if let cacheUri = cacheUri {
       DeviceCapability.cacheUri = URL(fileURLWithPath: cacheUri)
     } else {
